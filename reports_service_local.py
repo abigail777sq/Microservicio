@@ -12,36 +12,35 @@ from pydantic import BaseModel
 from sqlalchemy import Column
 from sqlalchemy.dialects.sqlite import JSON
 from dotenv import load_dotenv
-
 from sqlmodel import SQLModel, Field, create_engine, Session, select
-import openai
+import openai, re
+
 load_dotenv()
-# ============ CONFIG LOCAL ============
+
+# ==================== CONFIG ====================
 DB_URL = "sqlite:///./reports_local.db"
 OUTPUT_DIR = Path(os.getenv("REPORTS_OUTPUT_DIR", "./output_reports"))
 OUTPUT_DIR.mkdir(exist_ok=True)
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Coloca tu API key en .env
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 engine = create_engine(DB_URL)
 app = FastAPI(title="Reports Service (Local)")
 
-# ============ MODELO ============
+# ==================== MODELOS ====================
 class Report(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     tenant_id: uuid.UUID
     type: str
     period: str
-    params: dict = Field(sa_column=Column(JSON))  # ✅ Tipo JSON nativo
+    params: dict = Field(sa_column=Column(JSON))
     status: str = Field(default="processing")
     storage_key_pdf: str | None = None
     storage_key_tex: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-
 SQLModel.metadata.create_all(engine)
 
-# ============ MODELOS DE REQUEST ============
 class ReportRequest(BaseModel):
     tenant_id: uuid.UUID
     type: str
@@ -49,21 +48,91 @@ class ReportRequest(BaseModel):
     params: dict
     ai_prompt: str | None = "Genera un documento en LaTeX que resuma los datos financieros proporcionados."
 
-# ============ FUNCIÓN IA ============
+# ==================== UTILIDAD ====================
+def sanitize_latex(text: str) -> str:
+    """Escapa caracteres especiales solo en texto plano, sin alterar comandos LaTeX."""
+    if not isinstance(text, str):
+        text = str(text)
+    replacements = {
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    for char, escaped in replacements.items():
+        text = re.sub(rf"(?<!\\){re.escape(char)}", escaped, text)
+    return text
+
+# ==================== IA: GENERAR LATEX ====================
 def generate_latex_from_ai(params: dict, prompt: str) -> str:
-    """Genera un documento LaTeX usando OpenAI GPT."""
-    content = f"{prompt}\n\nParámetros:\n{json.dumps(params, indent=2, ensure_ascii=False)}"
+    """Genera un documento LaTeX completo y válido."""
+    system_prompt = (
+        "Eres un generador experto de reportes en LaTeX. "
+        "Tu salida debe ser un documento completo, comenzando con \\documentclass y "
+        "terminando con \\end{document}. Sin Markdown ni explicaciones."
+    )
+
+    user_prompt = f"""
+Instrucción: {prompt}
+
+Datos del reporte:
+{json.dumps(params, indent=2, ensure_ascii=False)}
+
+Genera un documento LaTeX completo en español, con estructura mínima profesional:
+- \\documentclass{{article}}
+- \\usepackage[utf8]{{inputenc}}
+- \\usepackage{{booktabs}}
+- \\begin{{document}} ... \\end{{document}}
+Incluye título, resumen, tabla con resultados y conclusión.
+"""
+
     response = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Eres un generador experto de documentos técnicos en LaTeX."},
-            {"role": "user", "content": content},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        temperature=0.3,
+        temperature=0.2,
     )
-    return response.choices[0].message.content
 
-# ============ FUNCIÓN COMPILACIÓN ============
+    latex_output = response.choices[0].message.content.strip()
+    latex_output = re.sub(r"^```latex|```$", "", latex_output, flags=re.MULTILINE).strip()
+
+    # Si no tiene estructura base, usa plantilla por defecto
+    if not latex_output.lstrip().startswith("\\documentclass"):
+        ventas = sanitize_latex(params.get("ventas", "N/A"))
+        costos = sanitize_latex(params.get("costos", "N/A"))
+        utilidad = sanitize_latex(params.get("utilidad", "N/A"))
+        comentario = sanitize_latex(params.get("comentario", "Sin comentarios."))
+
+        latex_output = rf"""
+\documentclass[12pt]{{article}}
+\usepackage[utf8]{{inputenc}}
+\usepackage{{booktabs}}
+\usepackage{{geometry}}
+\geometry{{margin=1in}}
+\begin{{document}}
+\section*{{Reporte Financiero}}
+Generado automáticamente a partir de los siguientes datos:
+\begin{{itemize}}
+\item Ventas: {ventas}
+\item Costos: {costos}
+\item Utilidad: {utilidad}
+\end{{itemize}}
+
+Comentario: {comentario}
+\end{{document}}
+""".strip()
+
+    # NO sanitizamos el documento completo (ya está escapado correctamente)
+    return latex_output
+
+# ==================== COMPILACIÓN ====================
 def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID) -> tuple[str, str]:
     """Guarda el contenido LaTeX y genera el PDF localmente."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -71,16 +140,18 @@ def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID) -> tuple[str, s
         pdf_path = Path(tmpdir) / f"{report_id}.pdf"
         tex_path.write_text(tex_content, encoding="utf-8")
 
-        # Compilar con pdflatex
-        subprocess.run(
+        result = subprocess.run(
             ["pdflatex", "-interaction=nonstopmode", tex_path.name],
             cwd=tmpdir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
+            capture_output=True,
+            text=True
         )
 
-        # Guardar en la carpeta local definitiva
+        if not pdf_path.exists():
+            raise RuntimeError(
+                f"LaTeX no produjo el PDF.\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+            )
+
         final_tex = OUTPUT_DIR / f"{report_id}.tex"
         final_pdf = OUTPUT_DIR / f"{report_id}.pdf"
         tex_path.replace(final_tex)
@@ -88,8 +159,7 @@ def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID) -> tuple[str, s
 
     return str(final_tex), str(final_pdf)
 
-# ============ ENDPOINTS ============
-
+# ==================== ENDPOINTS ====================
 @app.post("/reports/generate")
 def generate_report(req: ReportRequest):
     """Genera un nuevo reporte y lo guarda en local."""
@@ -105,9 +175,13 @@ def generate_report(req: ReportRequest):
         session.refresh(report)
 
     try:
+        # 🔹 Generar LaTeX con GPT
         latex = generate_latex_from_ai(req.params, req.ai_prompt)
+
+        # ⚙️ Compilar a PDF
         tex_path, pdf_path = compile_latex_to_pdf(latex, report.id)
 
+        # 🧾 Actualizar estado en base de datos
         with Session(engine) as session:
             report = session.get(Report, report.id)
             report.status = "ready"
@@ -116,20 +190,28 @@ def generate_report(req: ReportRequest):
             report.updated_at = datetime.utcnow()
             session.add(report)
             session.commit()
+            report_id = str(report.id)  # ✅ Guardamos antes de cerrar sesión
 
-        return {"id": str(report.id), "status": "ready", "pdf_path": pdf_path}
+        # ✅ Respuesta final
+        return {
+            "id": report_id,
+            "status": "ready",
+            "pdf_path": pdf_path,
+        }
 
     except Exception as e:
+        # ❌ Manejo de errores y actualización de estado
         with Session(engine) as session:
             report = session.get(Report, report.id)
             report.status = "error"
+            report.updated_at = datetime.utcnow()
             session.add(report)
             session.commit()
         raise HTTPException(status_code=500, detail=f"Error generando reporte: {e}")
 
+
 @app.get("/reports/{report_id}")
 def get_report(report_id: uuid.UUID):
-    """Devuelve metadatos del reporte."""
     with Session(engine) as session:
         report = session.exec(select(Report).where(Report.id == report_id)).first()
         if not report:
@@ -138,7 +220,6 @@ def get_report(report_id: uuid.UUID):
 
 @app.get("/reports/download/{report_id}")
 def download_report(report_id: uuid.UUID):
-    """Descarga el PDF generado."""
     with Session(engine) as session:
         report = session.exec(select(Report).where(Report.id == report_id)).first()
         if not report or not report.storage_key_pdf:
