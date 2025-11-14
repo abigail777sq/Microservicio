@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import boto3
 from sqlmodel import SQLModel, Field, create_engine, Session, select
 import openai, re
+import shutil
 
 load_dotenv()
 
@@ -40,9 +41,13 @@ else:
     else:
         DB_URL = os.getenv("DB_URL", "sqlite:///./reports_local.db")
 
-# Output directory (safe default)
+# Keep local copies? Set KEEP_LOCAL=true to keep files under OUTPUT_DIR in addition to uploading to S3
+KEEP_LOCAL = os.getenv("KEEP_LOCAL", "false").lower() in ("1", "true", "yes")
+
+# Output directory (only created if KEEP_LOCAL=true)
 OUTPUT_DIR = Path(os.getenv("REPORTS_OUTPUT_DIR", "./output_reports"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+if KEEP_LOCAL:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # OpenAI key (warn at startup if missing)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -56,6 +61,9 @@ S3_BUCKET = os.getenv("S3_BUCKET", "ocr-files-db")
 S3_PREFIX = os.getenv("S3_PREFIX", "pdf/")
 if S3_PREFIX and not S3_PREFIX.endswith("/"):
     S3_PREFIX = S3_PREFIX + "/"
+
+# Keep local copies? Set KEEP_LOCAL=true to keep files under OUTPUT_DIR in addition to uploading to S3
+KEEP_LOCAL = os.getenv("KEEP_LOCAL", "false").lower() in ("1", "true", "yes")
 
 # Create S3 client (uses standard boto3 env/auth configuration)
 s3_client = boto3.client("s3")
@@ -190,8 +198,29 @@ def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID, tenant_id: uuid
         pdf_path = Path(tmpdir) / f"{report_id}.pdf"
         tex_path.write_text(tex_content, encoding="utf-8")
 
+        # Check that pdflatex is available on PATH. If not, upload only the .tex file
+        pdflatex_path = shutil.which("pdflatex")
+        if not pdflatex_path:
+            # write the tex file and keep a local copy
+            tex_path.write_text(tex_content, encoding="utf-8")
+            tenant_folder = f"{tenant_id}"
+            s3_tex_key = f"{S3_PREFIX}{tenant_folder}/{report_id}.tex"
+            try:
+                s3_tex_path = upload_file_to_s3(str(tex_path), S3_BUCKET, s3_tex_key)
+            except Exception as e:
+                raise RuntimeError(f"pdflatex no está disponible y la subida .tex a S3 falló: {e}") from e
+
+            # Optionally keep local copy
+            if KEEP_LOCAL:
+                final_tex = OUTPUT_DIR / f"{report_id}.tex"
+                tex_path.replace(final_tex)
+
+            # No PDF produced
+            s3_pdf_path = None
+            return s3_tex_path, s3_pdf_path
+
         result = subprocess.run(
-            ["pdflatex", "-interaction=nonstopmode", tex_path.name],
+            [pdflatex_path, "-interaction=nonstopmode", tex_path.name],
             cwd=tmpdir,
             capture_output=True,
             text=True
@@ -202,24 +231,25 @@ def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID, tenant_id: uuid
                 f"LaTeX no produjo el PDF.\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
             )
 
-        # Local final copies
-        final_tex = OUTPUT_DIR / f"{report_id}.tex"
-        final_pdf = OUTPUT_DIR / f"{report_id}.pdf"
-        tex_path.replace(final_tex)
-        pdf_path.replace(final_pdf)
-
         # Build S3 keys: prefix / tenant_id / filename
         tenant_folder = f"{tenant_id}"
         s3_tex_key = f"{S3_PREFIX}{tenant_folder}/{report_id}.tex"
         s3_pdf_key = f"{S3_PREFIX}{tenant_folder}/{report_id}.pdf"
 
-        # Upload to S3
+        # Upload to S3 directly from the temporary directory
         try:
-            s3_tex_path = upload_file_to_s3(str(final_tex), S3_BUCKET, s3_tex_key)
-            s3_pdf_path = upload_file_to_s3(str(final_pdf), S3_BUCKET, s3_pdf_key)
+            s3_tex_path = upload_file_to_s3(str(tex_path), S3_BUCKET, s3_tex_key)
+            s3_pdf_path = upload_file_to_s3(str(pdf_path), S3_BUCKET, s3_pdf_key)
         except Exception as e:
-            # Keep local copies for debugging, but surface the error upstream
+            # Keep temp files around for debugging by raising with context
             raise RuntimeError(f"Error subiendo archivos a S3: {e}") from e
+
+        # Optionally keep local copies under OUTPUT_DIR for debugging
+        if KEEP_LOCAL:
+            final_tex = OUTPUT_DIR / f"{report_id}.tex"
+            final_pdf = OUTPUT_DIR / f"{report_id}.pdf"
+            tex_path.replace(final_tex)
+            pdf_path.replace(final_pdf)
 
     return s3_tex_path, s3_pdf_path
 

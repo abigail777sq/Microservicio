@@ -104,6 +104,32 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/reports/generate -Method Post -Body
 ## Notes & Troubleshooting
 
 - If `pdflatex` is not found, install a LaTeX distribution and ensure `pdflatex` is on your PATH.
+ - If `pdflatex` is not found, install a LaTeX distribution and ensure `pdflatex` is on your PATH. On Windows you can:
+  - Install MiKTeX (recommended GUI installer) from https://miktex.org/
+  - Or install TeX Live: https://tug.org/texlive/
+  - If you use Chocolatey (admin):
+
+```powershell
+choco install miktex
+```
+
+After installation, restart your terminal and verify:
+
+```powershell
+pdflatex --version
+```
+
+If you cannot install a LaTeX distribution on the host, the service will still upload the generated `.tex` file to S3 (under `pdf/{tenant_id}/{report_id}.tex`) but no PDF will be produced. Use a machine/container with LaTeX to generate PDFs later, or run the service in an environment with TeX installed.
+
+Config option: KEEP_LOCAL
+-------------------------
+By default the service uploads generated files directly to S3 under the `pdf/` prefix and does not retain them on the host. If you'd like the service to keep local copies under `output_reports/` in addition to uploading to S3, set this environment variable before starting the app:
+
+```powershell
+$env:KEEP_LOCAL = "true"
+```
+
+When `KEEP_LOCAL` is not set (default), the temporary files used to generate the PDF are removed after upload and only the S3 objects remain.
 - The script uses OpenAI's Chat Completions API; ensure your key has the correct access and quota.
 - If you modify database models, the SQLite file is `reports_local.db` in the repo root.
 
