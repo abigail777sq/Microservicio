@@ -76,7 +76,7 @@ pip install -r requirements.txt
 ```
 3. Start the app:
 ```powershell
-uvicorn reports_service_local:app --reload --host 0.0.0.0 --port 8000
+uvicorn reports_service_local:app --reload --host 0.0.0.0 --port 8001
 ```
 
 ## Example usage
