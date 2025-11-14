@@ -17,91 +17,91 @@ Install in a virtual environment (PowerShell):
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
+-
+```markdown
+# Reports Service (Local) — Flow of use
+
+This microservice generates LaTeX reports from JSON data using OpenAI, compiles them to PDF (if a TeX engine is available), and stores artifacts directly in an S3 bucket under the `pdf/` prefix. This README explains the end-to-end flow and how to use the service.
+
+## High-level flow
+
+1. Start the service (FastAPI via Uvicorn).
+2. POST a report request to `/reports/generate` with tenant_id, type, period and params.
+3. The service:
+   - Stores a Report row in the database with status="processing".
+   - Calls OpenAI to produce a LaTeX document from the provided params and prompt.
+   - Attempts to compile the LaTeX to PDF using `pdflatex`:
+     - If `pdflatex` is available, it produces a PDF and uploads both `.tex` and `.pdf` directly to S3 at `s3://<bucket>/pdf/{tenant_id}/{report_id}.(tex|pdf)`.
+     - If `pdflatex` is not available, it uploads only the `.tex` file to S3 at `s3://<bucket>/pdf/{tenant_id}/{report_id}.tex` and `storage_key_pdf` will be null.
+   - Updates the Report row to `ready` (or `error` on failure) and stores the S3 paths in `storage_key_tex` and `storage_key_pdf`.
+4. Clients can GET `/reports/{report_id}` to read metadata, or `/reports/download/{report_id}` to download the PDF (the endpoint returns the file when `storage_key_pdf` exists).
+
+## Endpoints (quick)
+- POST /reports/generate
+  - Body: { tenant_id: UUID, type: str, period: str, params: dict, ai_prompt?: str }
+  - Returns: { id, status, pdf_path } — pdf_path is the S3 path or null.
+- GET /reports/{report_id} — returns the DB row
+- GET /reports/download/{report_id} — returns the PDF file when available
+- GET /healthz — returns status and the configured output path (if any)
+
+## S3 layout and naming
+- Bucket (default): `ocr-files-db` (configurable with `S3_BUCKET`).
+- Prefix (default): `pdf/` (configurable with `S3_PREFIX`).
+- Objects are uploaded under: `pdf/{tenant_id}/{report_id}.tex` and `pdf/{tenant_id}/{report_id}.pdf`.
+
+Note: by default the service uploads directly to S3 and does not keep files on the host. If you want local copies, set `KEEP_LOCAL=true` (see the configuration section below).
+
+## Configuration and environment variables
+- `OPENAI_API_KEY` — OpenAI key used to generate LaTeX.
+- `S3_BUCKET`, `S3_PREFIX` — target S3 location (defaults: `ocr-files-db`, `pdf/`).
+- `DATABASE_URL` or `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — database configuration (Postgres is supported; otherwise local SQLite is used).
+- `KEEP_LOCAL` — when true, the service will also keep copies under `output_reports/` after uploading to S3. Default: false.
+
+Security note: do NOT commit secrets to the repository. Use environment variables, secret managers, or IAM roles. If any secret was committed previously, rotate it immediately.
+
+## Running the service (short)
+1. Create a Python virtualenv and install dependencies:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
-
-## Environment variables
-
-The project uses a `.env` file and `python-dotenv` to load the `OPENAI_API_KEY`. There is currently an API key in `.env` in this repository — this is a secret and should be removed from version control. Replace it with your own key or set the environment variable before running:
-
+2. Set required environment variables (example):
 ```powershell
-$env:OPENAI_API_KEY = "sk-your-key"
+# $env:OPENAI_API_KEY = 'sk-...'
+# $env:S3_BUCKET = 'ocr-files-db'
+# $env:S3_PREFIX = 'pdf/'
+# $env:DATABASE_URL = 'postgresql://user:pass@host:5432/db'  # optional
 ```
-
-### S3 configuration (optional)
-
-This project can upload generated `.tex` and `.pdf` files to an S3 bucket. By default it will use the bucket `ocr-files-db` and the prefix `pdf/` and will place files under `pdf/{tenant_id}/{report_id}.pdf`.
-
-Set these environment variables if you want to customize or to ensure credentials are available:
-
-```powershell
-$env:S3_BUCKET = "ocr-files-db"
-$env:S3_PREFIX = "pdf/"
-# Standard AWS creds (or configure via AWS CLI / shared config)
-$env:AWS_ACCESS_KEY_ID = "your_aws_key" # only needed if you are not using an IAM role or profile
-$env:AWS_DEFAULT_REGION = "us-east-1"
-```
-
-If no AWS credentials are set, boto3 will fall back to the default credential provider chain (profile, ECS/EC2 roles, etc.).
-
-Recommendation: avoid putting secrets directly in environment files. Prefer one of these methods instead:
-
-- Configure the AWS CLI with `aws configure` which stores credentials in `~/.aws/credentials`.
-- Use IAM roles (EC2/ECS/Lambda) or instance profiles so no static secret is required.
-- Use your cloud provider's secret store or CI secret variables.
-
-## Using a Postgres RDS database
-
-The service supports using a Postgres database (for example AWS RDS). It prefers a full `DATABASE_URL` environment variable, but you can also set these individual env vars:
-
-```powershell
-$env:DB_HOST = "aicfo-pg.cyb8ec4ca9b9.us-east-1.rds.amazonaws.com"
-$env:DB_PORT = "5432"
-$env:DB_NAME = "aicfo"
-$env:DB_USER = "app_admin"
-$env:DB_PASSWORD = "<your_password>"
-# or set a single DATABASE_URL:
-$env:DATABASE_URL = "postgresql://app_admin:<your_password>@aicfo-pg.cyb8ec4ca9b9.us-east-1.rds.amazonaws.com:5432/aicfo"
-```
-
-Notes:
-- The code will raise an error at startup if `DB_HOST` is set but `DB_NAME`, `DB_USER`, or `DB_PASSWORD` are missing (prevents partial misconfiguration).
-- Install the Postgres driver before running if you use Postgres:
-
-```powershell
-pip install psycopg2-binary
-```
-
-- Do not commit credentials to version control. If you accidentally committed secrets, rotate them immediately.
-
-## Run the service
-
-Start the FastAPI app using Uvicorn:
-
+3. Start the app:
 ```powershell
 uvicorn reports_service_local:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The service exposes these endpoints:
-- `POST /reports/generate` - generate a report (JSON body, see example below)
-- `GET /reports/{report_id}` - get report metadata
-- `GET /reports/download/{report_id}` - download compiled PDF
-- `GET /healthz` - health and output directory
-
-### Example request (PowerShell)
-
+## Example usage
+1. POST a generate request to `/reports/generate` (see the example in the repository). The response will contain the report ID and the S3 PDF path (or null if no PDF was produced).
+2. Verify objects in S3:
 ```powershell
-$body = @{
-  tenant_id = "11111111-1111-1111-1111-111111111111"
-  type = "financiero"
-  period = "2025-Q3"
-  params = @{ ventas = 100000; costos = 60000; utilidad = 40000; comentario = "Buen trimestre" }
-} | ConvertTo-Json -Depth 10
-
-Invoke-RestMethod -Uri http://127.0.0.1:8000/reports/generate -Method Post -Body $body -ContentType "application/json"
+aws s3 ls s3://ocr-files-db/pdf/<tenant_id>/ --recursive
 ```
+3. Download the PDF via the `/reports/download/{report_id}` endpoint once `storage_key_pdf` is present.
 
-## Notes & Troubleshooting
+## Behavior when `pdflatex` is not available
+- The service will still upload the `.tex` file to S3 at `pdf/{tenant_id}/{report_id}.tex`.
+- `storage_key_pdf` will be null and `/reports/download/{report_id}` will return 404 until a PDF exists.
+
+If you need help putting a compilation worker in place (for example a small pod/container that pulls `.tex` files from S3, runs `pdflatex` and writes back the PDF), I can help design or implement that.
+
+## Troubleshooting
+- If `pdflatex` is missing, install MiKTeX or TeX Live on Windows and verify `pdflatex --version` works.
+- Check logs from the FastAPI process for OpenAI errors or S3 permission problems.
+- Confirm AWS permissions: the service needs PutObject on the target bucket/prefix.
+
+---
+
+If you'd like, I can also add a short diagram or a small sample script that watches S3 and compiles `.tex` files in a separate worker. Let me know which addition you'd prefer.
+```
 
 - If `pdflatex` is not found, install a LaTeX distribution and ensure `pdflatex` is on your PATH.
  - If `pdflatex` is not found, install a LaTeX distribution and ensure `pdflatex` is on your PATH. On Windows you can:
