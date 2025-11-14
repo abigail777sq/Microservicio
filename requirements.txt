@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+openai
+python-dotenv
+sqlmodel
+sqlalchemy
+pydantic
+typing-extensions
+boto3

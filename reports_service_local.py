@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import Column
 from sqlalchemy.dialects.sqlite import JSON
 from dotenv import load_dotenv
+import boto3
 from sqlmodel import SQLModel, Field, create_engine, Session, select
 import openai, re
 
@@ -22,6 +23,16 @@ DB_URL = "sqlite:///./reports_local.db"
 OUTPUT_DIR = Path(os.getenv("REPORTS_OUTPUT_DIR", "./output_reports"))
 OUTPUT_DIR.mkdir(exist_ok=True)
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# S3 configuration: default to the bucket and prefix you specified
+S3_BUCKET = os.getenv("S3_BUCKET", "ocr-files-db")
+# ensure prefix ends with slash if provided
+S3_PREFIX = os.getenv("S3_PREFIX", "pdf/")
+if S3_PREFIX and not S3_PREFIX.endswith("/"):
+    S3_PREFIX = S3_PREFIX + "/"
+
+# Create S3 client (uses standard boto3 env/auth configuration)
+s3_client = boto3.client("s3")
 
 engine = create_engine(DB_URL)
 app = FastAPI(title="Reports Service (Local)")
@@ -133,8 +144,21 @@ Comentario: {comentario}
     return latex_output
 
 # ==================== COMPILACIÓN ====================
-def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID) -> tuple[str, str]:
-    """Guarda el contenido LaTeX y genera el PDF localmente."""
+def upload_file_to_s3(local_path: str, bucket: str, key: str) -> str:
+    """Upload a local file to S3 and return the s3:// path.
+
+    Raises the underlying boto3 exception on failure.
+    """
+    s3_client.upload_file(local_path, bucket, key)
+    return f"s3://{bucket}/{key}"
+
+
+def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID, tenant_id: uuid.UUID) -> tuple[str, str]:
+    """Guarda el contenido LaTeX, genera el PDF localmente y sube ambos a S3.
+
+    Returns (s3_tex_path, s3_pdf_path) as strings (s3://...)
+    Also keeps a local copy under OUTPUT_DIR for convenience.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tex_path = Path(tmpdir) / f"{report_id}.tex"
         pdf_path = Path(tmpdir) / f"{report_id}.pdf"
@@ -152,12 +176,26 @@ def compile_latex_to_pdf(tex_content: str, report_id: uuid.UUID) -> tuple[str, s
                 f"LaTeX no produjo el PDF.\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
             )
 
+        # Local final copies
         final_tex = OUTPUT_DIR / f"{report_id}.tex"
         final_pdf = OUTPUT_DIR / f"{report_id}.pdf"
         tex_path.replace(final_tex)
         pdf_path.replace(final_pdf)
 
-    return str(final_tex), str(final_pdf)
+        # Build S3 keys: prefix / tenant_id / filename
+        tenant_folder = f"{tenant_id}"
+        s3_tex_key = f"{S3_PREFIX}{tenant_folder}/{report_id}.tex"
+        s3_pdf_key = f"{S3_PREFIX}{tenant_folder}/{report_id}.pdf"
+
+        # Upload to S3
+        try:
+            s3_tex_path = upload_file_to_s3(str(final_tex), S3_BUCKET, s3_tex_key)
+            s3_pdf_path = upload_file_to_s3(str(final_pdf), S3_BUCKET, s3_pdf_key)
+        except Exception as e:
+            # Keep local copies for debugging, but surface the error upstream
+            raise RuntimeError(f"Error subiendo archivos a S3: {e}") from e
+
+    return s3_tex_path, s3_pdf_path
 
 # ==================== ENDPOINTS ====================
 @app.post("/reports/generate")
@@ -178,8 +216,8 @@ def generate_report(req: ReportRequest):
         # 🔹 Generar LaTeX con GPT
         latex = generate_latex_from_ai(req.params, req.ai_prompt)
 
-        # ⚙️ Compilar a PDF
-        tex_path, pdf_path = compile_latex_to_pdf(latex, report.id)
+        # ⚙️ Compilar a PDF (ahora sube a S3)
+        tex_path, pdf_path = compile_latex_to_pdf(latex, report.id, report.tenant_id)
 
         # 🧾 Actualizar estado en base de datos
         with Session(engine) as session:
