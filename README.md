@@ -38,12 +38,17 @@ Set these environment variables if you want to customize or to ensure credential
 $env:S3_BUCKET = "ocr-files-db"
 $env:S3_PREFIX = "pdf/"
 # Standard AWS creds (or configure via AWS CLI / shared config)
-$env:AWS_ACCESS_KEY_ID = "your_aws_key"
-$env:AWS_SECRET_ACCESS_KEY = "your_aws_secret"
+$env:AWS_ACCESS_KEY_ID = "your_aws_key" # only needed if you are not using an IAM role or profile
 $env:AWS_DEFAULT_REGION = "us-east-1"
 ```
 
 If no AWS credentials are set, boto3 will fall back to the default credential provider chain (profile, ECS/EC2 roles, etc.).
+
+Recommendation: avoid putting secrets directly in environment files. Prefer one of these methods instead:
+
+- Configure the AWS CLI with `aws configure` which stores credentials in `~/.aws/credentials`.
+- Use IAM roles (EC2/ECS/Lambda) or instance profiles so no static secret is required.
+- Use your cloud provider's secret store or CI secret variables.
 
 ## Using a Postgres RDS database
 
