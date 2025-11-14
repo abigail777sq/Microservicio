@@ -7,3 +7,4 @@ sqlalchemy
 pydantic
 typing-extensions
 boto3
+psycopg2-binary

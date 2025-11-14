@@ -19,10 +19,36 @@ import openai, re
 load_dotenv()
 
 # ==================== CONFIG ====================
-DB_URL = "sqlite:///./reports_local.db"
+# Database configuration: prefer a full DATABASE_URL, then DB_* parts, otherwise fallback to local sqlite.
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    DB_URL = DATABASE_URL
+else:
+    DB_HOST = os.getenv("DB_HOST")
+    if DB_HOST:
+        DB_PORT = os.getenv("DB_PORT", "5432")
+        DB_NAME = os.getenv("DB_NAME", "")
+        DB_USER = os.getenv("DB_USER", "")
+        DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+        # require the minimal set if a host is provided
+        if not all([DB_NAME, DB_USER, DB_PASSWORD]):
+            raise RuntimeError(
+                "DB_HOST is set but DB_NAME, DB_USER and DB_PASSWORD must also be provided."
+            )
+        # Build a SQLAlchemy-compatible Postgres URL (psycopg2)
+        DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    else:
+        DB_URL = os.getenv("DB_URL", "sqlite:///./reports_local.db")
+
+# Output directory (safe default)
 OUTPUT_DIR = Path(os.getenv("REPORTS_OUTPUT_DIR", "./output_reports"))
-OUTPUT_DIR.mkdir(exist_ok=True)
-openai.api_key = os.getenv("OPENAI_API_KEY")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# OpenAI key (warn at startup if missing)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    print("Warning: OPENAI_API_KEY not set. OpenAI requests will fail until a key is provided.")
+openai.api_key = OPENAI_API_KEY
 
 # S3 configuration: default to the bucket and prefix you specified
 S3_BUCKET = os.getenv("S3_BUCKET", "ocr-files-db")

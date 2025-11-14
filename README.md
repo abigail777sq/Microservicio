@@ -45,6 +45,30 @@ $env:AWS_DEFAULT_REGION = "us-east-1"
 
 If no AWS credentials are set, boto3 will fall back to the default credential provider chain (profile, ECS/EC2 roles, etc.).
 
+## Using a Postgres RDS database
+
+The service supports using a Postgres database (for example AWS RDS). It prefers a full `DATABASE_URL` environment variable, but you can also set these individual env vars:
+
+```powershell
+$env:DB_HOST = "aicfo-pg.cyb8ec4ca9b9.us-east-1.rds.amazonaws.com"
+$env:DB_PORT = "5432"
+$env:DB_NAME = "aicfo"
+$env:DB_USER = "app_admin"
+$env:DB_PASSWORD = "<your_password>"
+# or set a single DATABASE_URL:
+$env:DATABASE_URL = "postgresql://app_admin:<your_password>@aicfo-pg.cyb8ec4ca9b9.us-east-1.rds.amazonaws.com:5432/aicfo"
+```
+
+Notes:
+- The code will raise an error at startup if `DB_HOST` is set but `DB_NAME`, `DB_USER`, or `DB_PASSWORD` are missing (prevents partial misconfiguration).
+- Install the Postgres driver before running if you use Postgres:
+
+```powershell
+pip install psycopg2-binary
+```
+
+- Do not commit credentials to version control. If you accidentally committed secrets, rotate them immediately.
+
 ## Run the service
 
 Start the FastAPI app using Uvicorn:
